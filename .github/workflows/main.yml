@@ -1,13 +1,12 @@
 name: Build Gentoo Next ISO
 on:
-  workflow_dispatch: # Button to manually trigger
+  workflow_dispatch:
   push:
     branches: [ "main" ]
 
 jobs:
   build-iso:
     runs-on: ubuntu-latest
-    # specific container needed for mounting/squashing capabilities
     container:
       image: ubuntu:latest
       options: --privileged
@@ -19,89 +18,68 @@ jobs:
     - name: Install Build Tools
       run: |
         apt-get update
-        apt-get install -y wget squashfs-tools xorriso sed curl file
+        apt-get install -y wget squashfs-tools xorriso sed file
 
-    - name: Download Latest Gentoo ISO (Auto-Detect)
+    - name: Download Base Gentoo ISO
       run: |
-        echo "🔍 Checking Gentoo servers for the latest Minimal ISO..."
-        
-        # Define the directory where Gentoo stores daily/weekly builds
-        BASE_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds"
-        
-        # Read the text file that points to the current valid ISO
-        # This handles the "20251122T..." folder rotation automatically
-        ISO_REL_PATH=$(curl -s "${BASE_URL}/latest-install-amd64-minimal.txt" | grep -v "^#" | awk '{print $1}' | head -n 1)
-        
-        if [ -z "$ISO_REL_PATH" ]; then
-          echo "❌ Error: Could not find ISO path. Fallback to hardcoded link..."
-          # Emergency fallback if their API is down, using the link you provided
-          FULL_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/20251122T160055Z/install-amd64-minimal-20251122T160055Z.iso"
-        else
-          FULL_URL="${BASE_URL}/${ISO_REL_PATH}"
-        fi
-        
-        echo "✅ Target ISO: $FULL_URL"
-        
-        echo "⬇️ Downloading..."
-        wget -q --show-progress -O base.iso "$FULL_URL"
+        echo "Downloading specific ISO version..."
+        wget -q --show-progress -O base.iso "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251122T160055Z/install-amd64-minimal-20251122T160055Z.iso"
 
     - name: Extract ISO Contents
       run: |
-        echo "📦 Extracting ISO structure..."
+        echo "Extracting ISO structure..."
         xorriso -osirrox on -indev base.iso -extract / iso_content
 
-    - name: Unpack Root Filesystem (SquashFS)
+    - name: Unpack Root Filesystem
       run: |
-        echo "🔓 Unsquashing root filesystem (this holds the OS)..."
+        echo "Unsquashing root filesystem..."
         unsquashfs -d squashfs-root iso_content/image.squashfs
         rm iso_content/image.squashfs
 
     - name: Inject GPM and Branding
       run: |
-        echo "💉 Injecting Gentoo Next customizations..."
+        echo "Injecting Gentoo Next customizations..."
         
-        # 1. Verify GPM exists in repo
         if [ ! -f gpm ]; then
-          echo "❌ ERROR: 'gpm' file not found in repo root!"
+          echo "ERROR: 'gpm' file not found in repo root!"
           exit 1
         fi
 
-        # 2. Install GPM to /usr/bin/
+        # Install GPM
         cp gpm squashfs-root/usr/bin/gpm
         chmod +x squashfs-root/usr/bin/gpm
         
-        # 3. Create necessary directories for GPM
+        # Create directories
         mkdir -p squashfs-root/etc/gpm
         mkdir -p squashfs-root/var/log/gpm
         mkdir -p squashfs-root/var/cache/gpm
         
-        # 4. BRANDING: Update /etc/os-release
-        # This makes the system identify as Gentoo Next
+        # Branding: OS Release
         if [ -f squashfs-root/etc/os-release ]; then
           sed -i 's/^NAME=.*/NAME="Gentoo Next"/' squashfs-root/etc/os-release
           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Next (GPM Edition)"/' squashfs-root/etc/os-release
           sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
         fi
 
-        # 5. BRANDING: Update MOTD (Message shown on login)
-        echo -e "\n\033[1;35mWelcome to Gentoo Next\033[0m" > squashfs-root/etc/motd
+        # Branding: MOTD
+        echo "" > squashfs-root/etc/motd
+        echo "Welcome to Gentoo Next" >> squashfs-root/etc/motd
         echo "Powered by GPM Package Manager" >> squashfs-root/etc/motd
         echo "Run 'gpm help' to get started." >> squashfs-root/etc/motd
         echo "" >> squashfs-root/etc/motd
         
-        # 6. Create a default GPM config
+        # Config
         echo "CORES=auto" > squashfs-root/etc/gpm/config
         echo "SAFE_MODE=true" >> squashfs-root/etc/gpm/config
 
     - name: Repack Root Filesystem
       run: |
-        echo "🔒 Compressing filesystem back to SquashFS..."
-        # -comp xz gives best compression (small ISO) but takes CPU
+        echo "Compressing filesystem back to SquashFS..."
         mksquashfs squashfs-root iso_content/image.squashfs -comp xz -noappend
 
     - name: Build Final Bootable ISO
       run: |
-        echo "💿 Generating .iso file..."
+        echo "Generating .iso file..."
         cd iso_content
         
         xorriso -as mkisofs \
@@ -115,7 +93,6 @@ jobs:
            -output ../gentoo-next.iso \
            . \
         || \
-        # Fallback if ISOLINUX path varies
         xorriso -as mkisofs \
            -r -J -joliet-long \
            -l -iso-level 3 \
