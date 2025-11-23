@@ -1,8 +1,19 @@
 name: Build Gentoo Next ISO
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main" ]
+    inputs:
+      create_release:
+        description: 'Upload to GitHub Releases?'
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release Tag (e.g. v1.0-beta)'
+        required: false
+        default: 'nightly-build'
+
+permissions:
+  contents: write  # REQUIRED to create Releases
 
 jobs:
   build-iso:
@@ -38,8 +49,6 @@ jobs:
 
     - name: Inject GPM and Branding
       run: |
-        echo "Injecting Gentoo Next customizations..."
-        
         if [ ! -f gpm ]; then
           echo "ERROR: 'gpm' file not found in repo root!"
           exit 1
@@ -49,19 +58,19 @@ jobs:
         cp gpm squashfs-root/usr/bin/gpm
         chmod +x squashfs-root/usr/bin/gpm
         
-        # Create directories
+        # Directories
         mkdir -p squashfs-root/etc/gpm
         mkdir -p squashfs-root/var/log/gpm
         mkdir -p squashfs-root/var/cache/gpm
         
-        # Branding: OS Release
+        # OS Release
         if [ -f squashfs-root/etc/os-release ]; then
           sed -i 's/^NAME=.*/NAME="Gentoo Next"/' squashfs-root/etc/os-release
           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Next (GPM Edition)"/' squashfs-root/etc/os-release
           sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
         fi
 
-        # Branding: MOTD
+        # MOTD
         echo "" > squashfs-root/etc/motd
         echo "Welcome to Gentoo Next" >> squashfs-root/etc/motd
         echo "Powered by GPM Package Manager" >> squashfs-root/etc/motd
@@ -74,8 +83,7 @@ jobs:
 
     - name: Repack Root Filesystem
       run: |
-        echo "Compressing filesystem back to SquashFS..."
-        # Using gzip for speed to avoid GitHub Action timeout
+        echo "Compressing filesystem (gzip for speed)..."
         mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
 
     - name: Build Final Bootable ISO (GRUB Hybrid)
@@ -83,15 +91,12 @@ jobs:
         echo "Detecting GRUB bootloader files..."
         cd iso_content
         
-        # 1. Find the BIOS boot image (usually eltortio.img inside boot/grub/i386-pc)
         BIOS_IMG=$(find boot/grub -name eltorito.img)
-        
         if [ -z "$BIOS_IMG" ]; then
-           echo "WARNING: eltorito.img not found. Searching for ANY .img in i386-pc..."
+           # Fallback search
            BIOS_IMG=$(find boot/grub/i386-pc -name "*.img" | head -n 1)
         fi
         
-        # 2. Find the UEFI boot image (efi.img is usually in root)
         UEFI_IMG=$(find . -maxdepth 2 -name efi.img | sed 's|^\./||')
         
         if [ -z "$BIOS_IMG" ]; then
@@ -99,11 +104,7 @@ jobs:
            exit 1
         fi
         
-        echo "BIOS Image: $BIOS_IMG"
-        echo "UEFI Image: $UEFI_IMG"
-        
         echo "Building GRUB Hybrid ISO..."
-        
         xorriso -as mkisofs \
            -iso-level 3 \
            -full-iso9660-filenames \
@@ -116,9 +117,29 @@ jobs:
            -output ../gentoo-next.iso \
            .
 
+    # 1. Always upload as an artifact (Zip file) for debugging
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: gentoo-next-iso
         path: gentoo-next.iso
         retention-days: 3
+
+    # 2. OPTIONAL: Upload to GitHub Releases if checkbox was checked
+    - name: Create Release
+      if: ${{ inputs.create_release == true }}
+      uses: softprops/action-gh-release@v1
+      with:
+        name: "Build by GH Action (${{ inputs.release_tag }})"
+        tag_name: "v${{ github.run_number }}-${{ inputs.release_tag }}"
+        body: |
+          ### Gentoo Next (Automated Build)
+          - **Date**: ${{ steps.date.outputs.date }}
+          - **Base**: Gentoo Minimal 20251122
+          - **GPM Version**: Latest from repository
+          
+          *This is an automated pre-release build.*
+        files: gentoo-next.iso
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
