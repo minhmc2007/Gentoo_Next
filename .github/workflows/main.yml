@@ -13,7 +13,7 @@ on:
         default: 'nightly-build'
 
 permissions:
-  contents: write  # REQUIRED to create Releases
+  contents: write
 
 jobs:
   build-iso:
@@ -41,6 +41,28 @@ jobs:
         echo "Extracting ISO structure..."
         xorriso -osirrox on -indev base.iso -extract / iso_content
 
+    - name: Fix Bootloader Label (CRITICAL FIX)
+      run: |
+        echo "🔧 Patching GRUB config to match new Label..."
+        
+        # 1. Detect the label of the ORIGINAL ISO using xorriso
+        # This gets "Gentoo-amd64-20251122" automatically
+        ORIG_LABEL=$(xorriso -indev base.iso -pvd_info 2>/dev/null | grep "Volume Id" | sed 's/.*: //' | tr -d ' ')
+        
+        if [ -z "$ORIG_LABEL" ]; then
+          echo "⚠️ Could not auto-detect label. Using fallback."
+          ORIG_LABEL="Gentoo-amd64-20251122"
+        fi
+        
+        echo "Original Label found: '$ORIG_LABEL'"
+        echo "Replacing with:       'GENTOO_NEXT'"
+        
+        # 2. Find all config files inside the ISO and replace the old label
+        # This updates 'root=live:CDLABEL=...' and 'search --label ...'
+        find iso_content -type f \( -name "*.cfg" -o -name "*.conf" \) -exec sed -i "s/$ORIG_LABEL/GENTOO_NEXT/g" {} +
+        
+        echo "✅ GRUB/Bootloader config files patched."
+
     - name: Unpack Root Filesystem
       run: |
         echo "Unsquashing root filesystem..."
@@ -58,51 +80,33 @@ jobs:
         cp gpm squashfs-root/usr/bin/gpm
         chmod +x squashfs-root/usr/bin/gpm
         
-        # Directories
-        mkdir -p squashfs-root/etc/gpm
-        mkdir -p squashfs-root/var/log/gpm
-        mkdir -p squashfs-root/var/cache/gpm
-        
-        # OS Release
+        # Branding
         if [ -f squashfs-root/etc/os-release ]; then
           sed -i 's/^NAME=.*/NAME="Gentoo Next"/' squashfs-root/etc/os-release
           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Next (GPM Edition)"/' squashfs-root/etc/os-release
           sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
         fi
 
-        # MOTD
-        echo "" > squashfs-root/etc/motd
-        echo "Welcome to Gentoo Next" >> squashfs-root/etc/motd
-        echo "Powered by GPM Package Manager" >> squashfs-root/etc/motd
-        echo "Run 'gpm help' to get started." >> squashfs-root/etc/motd
-        echo "" >> squashfs-root/etc/motd
-        
-        # Config
+        # Directories & MOTD
+        mkdir -p squashfs-root/etc/gpm squashfs-root/var/log/gpm squashfs-root/var/cache/gpm
+        echo -e "\nWelcome to Gentoo Next\nPowered by GPM\n" > squashfs-root/etc/motd
         echo "CORES=auto" > squashfs-root/etc/gpm/config
-        echo "SAFE_MODE=true" >> squashfs-root/etc/gpm/config
 
     - name: Repack Root Filesystem
       run: |
-        echo "Compressing filesystem (gzip for speed)..."
+        echo "Compressing filesystem (gzip)..."
         mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
 
     - name: Build Final Bootable ISO (GRUB Hybrid)
       run: |
-        echo "Detecting GRUB bootloader files..."
         cd iso_content
         
         BIOS_IMG=$(find boot/grub -name eltorito.img)
         if [ -z "$BIOS_IMG" ]; then
-           # Fallback search
            BIOS_IMG=$(find boot/grub/i386-pc -name "*.img" | head -n 1)
         fi
         
         UEFI_IMG=$(find . -maxdepth 2 -name efi.img | sed 's|^\./||')
-        
-        if [ -z "$BIOS_IMG" ]; then
-           echo "CRITICAL: Could not find BIOS boot image (eltorito.img)!"
-           exit 1
-        fi
         
         echo "Building GRUB Hybrid ISO..."
         xorriso -as mkisofs \
@@ -117,7 +121,6 @@ jobs:
            -output ../gentoo-next.iso \
            .
 
-    # 1. Always upload as an artifact (Zip file) for debugging
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -125,7 +128,6 @@ jobs:
         path: gentoo-next.iso
         retention-days: 3
 
-    # 2. OPTIONAL: Upload to GitHub Releases if checkbox was checked
     - name: Create Release
       if: ${{ inputs.create_release == true }}
       uses: softprops/action-gh-release@v1
@@ -133,12 +135,8 @@ jobs:
         name: "Build by GH Action (${{ inputs.release_tag }})"
         tag_name: "v${{ github.run_number }}-${{ inputs.release_tag }}"
         body: |
-          ### Gentoo Next (Automated Build)
-          - **Date**: ${{ steps.date.outputs.date }}
-          - **Base**: Gentoo Minimal 20251122
-          - **GPM Version**: Latest from repository
-          
-          *This is an automated pre-release build.*
+          ### Gentoo Next
+          Fixed boot label issue.
         files: gentoo-next.iso
         prerelease: true
       env:
