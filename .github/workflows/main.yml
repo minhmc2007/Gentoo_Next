@@ -18,13 +18,11 @@ jobs:
     - name: Install Build Tools
       run: |
         apt-get update
-        # Added 'isolinux' and 'syslinux-common' to fix the "path does not exist on disk" error
-        apt-get install -y wget squashfs-tools xorriso sed file isolinux syslinux-common
+        apt-get install -y wget squashfs-tools xorriso sed file
 
     - name: Download Base Gentoo ISO
       run: |
         echo "Downloading specific ISO version..."
-        # Using the link you provided
         wget -q --show-progress -O base.iso "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251122T160055Z/install-amd64-minimal-20251122T160055Z.iso"
 
     - name: Extract ISO Contents
@@ -77,38 +75,44 @@ jobs:
     - name: Repack Root Filesystem
       run: |
         echo "Compressing filesystem back to SquashFS..."
-        # Using gzip for faster speed (xz is better but slower), to avoid timeout
+        # Using gzip for speed to avoid GitHub Action timeout
         mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
 
-    - name: Detect Bootloader and Build ISO
+    - name: Build Final Bootable ISO (GRUB Hybrid)
       run: |
-        echo "Detecting bootloader location..."
+        echo "Detecting GRUB bootloader files..."
         cd iso_content
         
-        # Find where isolinux.bin is hiding
-        BOOT_BIN=$(find . -name isolinux.bin | head -n 1 | sed 's|^\./||')
-        BOOT_CAT=$(find . -name boot.cat | head -n 1 | sed 's|^\./||')
+        # 1. Find the BIOS boot image (usually eltortio.img inside boot/grub/i386-pc)
+        BIOS_IMG=$(find boot/grub -name eltorito.img)
         
-        if [ -z "$BOOT_BIN" ]; then
-          echo "CRITICAL ERROR: Could not find isolinux.bin in extracted ISO."
-          echo "File structure:"
-          find . -maxdepth 3
-          exit 1
+        if [ -z "$BIOS_IMG" ]; then
+           echo "WARNING: eltorito.img not found. Searching for ANY .img in i386-pc..."
+           BIOS_IMG=$(find boot/grub/i386-pc -name "*.img" | head -n 1)
         fi
         
-        echo "Found bootloader at: $BOOT_BIN"
-        echo "Found catalog at: $BOOT_CAT"
+        # 2. Find the UEFI boot image (efi.img is usually in root)
+        UEFI_IMG=$(find . -maxdepth 2 -name efi.img | sed 's|^\./||')
         
-        echo "Building ISO..."
+        if [ -z "$BIOS_IMG" ]; then
+           echo "CRITICAL: Could not find BIOS boot image (eltorito.img)!"
+           exit 1
+        fi
+        
+        echo "BIOS Image: $BIOS_IMG"
+        echo "UEFI Image: $UEFI_IMG"
+        
+        echo "Building GRUB Hybrid ISO..."
         
         xorriso -as mkisofs \
            -iso-level 3 \
            -full-iso9660-filenames \
            -volid "GENTOO_NEXT" \
-           -eltorito-boot "$BOOT_BIN" \
-           -eltorito-catalog "$BOOT_CAT" \
+           -eltorito-boot "$BIOS_IMG" \
            -no-emul-boot -boot-load-size 4 -boot-info-table \
-           -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+           -eltorito-alt-boot \
+           -e "$UEFI_IMG" \
+           -no-emul-boot -isohybrid-gpt-basdat \
            -output ../gentoo-next.iso \
            .
 
@@ -117,4 +121,4 @@ jobs:
       with:
         name: gentoo-next-iso
         path: gentoo-next.iso
-        retention-days: 5
+        retention-days: 3
