@@ -18,11 +18,13 @@ jobs:
     - name: Install Build Tools
       run: |
         apt-get update
-        apt-get install -y wget squashfs-tools xorriso sed file
+        # Added 'isolinux' and 'syslinux-common' to fix the "path does not exist on disk" error
+        apt-get install -y wget squashfs-tools xorriso sed file isolinux syslinux-common
 
     - name: Download Base Gentoo ISO
       run: |
         echo "Downloading specific ISO version..."
+        # Using the link you provided
         wget -q --show-progress -O base.iso "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251122T160055Z/install-amd64-minimal-20251122T160055Z.iso"
 
     - name: Extract ISO Contents
@@ -75,32 +77,39 @@ jobs:
     - name: Repack Root Filesystem
       run: |
         echo "Compressing filesystem back to SquashFS..."
-        mksquashfs squashfs-root iso_content/image.squashfs -comp xz -noappend
+        # Using gzip for faster speed (xz is better but slower), to avoid timeout
+        mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
 
-    - name: Build Final Bootable ISO
+    - name: Detect Bootloader and Build ISO
       run: |
-        echo "Generating .iso file..."
+        echo "Detecting bootloader location..."
         cd iso_content
+        
+        # Find where isolinux.bin is hiding
+        BOOT_BIN=$(find . -name isolinux.bin | head -n 1 | sed 's|^\./||')
+        BOOT_CAT=$(find . -name boot.cat | head -n 1 | sed 's|^\./||')
+        
+        if [ -z "$BOOT_BIN" ]; then
+          echo "CRITICAL ERROR: Could not find isolinux.bin in extracted ISO."
+          echo "File structure:"
+          find . -maxdepth 3
+          exit 1
+        fi
+        
+        echo "Found bootloader at: $BOOT_BIN"
+        echo "Found catalog at: $BOOT_CAT"
+        
+        echo "Building ISO..."
         
         xorriso -as mkisofs \
            -iso-level 3 \
            -full-iso9660-filenames \
            -volid "GENTOO_NEXT" \
-           -eltorito-boot isolinux/isolinux.bin \
-           -eltorito-catalog isolinux/boot.cat \
+           -eltorito-boot "$BOOT_BIN" \
+           -eltorito-catalog "$BOOT_CAT" \
            -no-emul-boot -boot-load-size 4 -boot-info-table \
            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
            -output ../gentoo-next.iso \
-           . \
-        || \
-        xorriso -as mkisofs \
-           -r -J -joliet-long \
-           -l -iso-level 3 \
-           -V "GENTOO_NEXT" \
-           -b isolinux/isolinux.bin \
-           -c isolinux/boot.cat \
-           -no-emul-boot -boot-load-size 4 -boot-info-table \
-           -o ../gentoo-next.iso \
            .
 
     - name: Upload Artifact
@@ -108,4 +117,4 @@ jobs:
       with:
         name: gentoo-next-iso
         path: gentoo-next.iso
-        retention-days: 3
+        retention-days: 5
