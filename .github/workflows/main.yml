@@ -1,4 +1,4 @@
-name: Build Gentoo Next (Custom Kernel)
+name: Build Gentoo Linux Next
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +23,7 @@ jobs:
 
     - name: Install Build Dependencies
       run: |
+        export DEBIAN_FRONTEND=noninteractive
         apt-get update
         # We need compilers for the kernel and tools for ISO
         apt-get install -y \
