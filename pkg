@@ -9,15 +9,15 @@ import json
 import shlex
 
 # --- CONSTANTS ---
-CONFIG_FILE = "/etc/gpm/config"
-LOG_DIR = "/var/log/gpm"
+CONFIG_FILE = "/etc/pkg/config"
+LOG_DIR = "/var/log/pkg"
 LOG_FILE = os.path.join(LOG_DIR, "history.log")
-CACHE_DIR = "/var/cache/gpm"
+CACHE_DIR = "/var/cache/pkg"
 CACHE_FILE = os.path.join(CACHE_DIR, "pkg_index.json")
-REPO_PATH = "/var/db/repos/gentoo" # Standard Portage tree path / Đường dẫn chuẩn của Portage tree
+REPO_PATH = "/var/db/repos/gentoo" 
 
 # --- 1. LOGGER (Real-time & Strip ANSI for file) ---
-class GPMLogger:
+class PkgLogger:
     HEADER = '\033[95m'
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -34,7 +34,9 @@ class GPMLogger:
             try:
                 os.makedirs(path, exist_ok=True)
             except PermissionError:
-                pass # Non-root user might fail, handled later / Người dùng thường có thể lỗi, xử lý sau
+                # Nếu không phải root, có thể không tạo được folder log
+                # Bỏ qua, chỉ in ra màn hình
+                pass
 
     def _strip_ansi(self, text):
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -48,9 +50,11 @@ class GPMLogger:
                 f.write(f"[{timestamp}] {clean_msg}\n")
         except PermissionError:
             pass 
+        except FileNotFoundError:
+            pass
 
     def info(self, msg):
-        formatted = f"{self.BLUE}[INFO]{self.ENDC} {msg}"
+        formatted = f"{self.BLUE}[PKG]{self.ENDC} {msg}"
         print(formatted)
         self.log_to_file(f"[INFO] {msg}")
 
@@ -69,13 +73,12 @@ class GPMLogger:
         print(formatted, file=sys.stderr)
         self.log_to_file(f"[ERROR] {msg}")
 
-# --- 2. CACHE MANAGER (Indexing & Search) ---
-class GPMCache:
+# --- 2. CACHE MANAGER ---
+class PkgCache:
     def __init__(self, logger):
         self.logger = logger
         
     def update_index(self):
-        """Quét thư mục portage để tạo index JSON nhanh / Scans portage directory to create fast JSON index."""
         self.logger.info("Updating package cache (Indexing)...")
         
         if not os.path.exists(REPO_PATH):
@@ -84,9 +87,7 @@ class GPMCache:
 
         packages = []
         try:
-            # Duyệt tối ưu bằng glob / Optimized traversal using glob
             categories = [d for d in os.listdir(REPO_PATH) if os.path.isdir(os.path.join(REPO_PATH, d)) and d[0] not in '._']
-            
             count = 0
             for cat in categories:
                 cat_path = os.path.join(REPO_PATH, cat)
@@ -95,7 +96,6 @@ class GPMCache:
                     packages.append(f"{cat}/{p}")
                     count += 1
             
-            # Tạo thư mục cache nếu chưa có / Create cache directory if not exists
             if not os.path.exists(CACHE_DIR):
                 os.makedirs(CACHE_DIR, exist_ok=True)
                 
@@ -109,11 +109,10 @@ class GPMCache:
             self.logger.error(f"Indexing error: {e}")
 
     def search(self, keyword):
-        """Tìm kiếm trong cache JSON / Search within JSON cache."""
         if not os.path.exists(CACHE_FILE):
-            self.logger.warn("Cache does not exist. Please run 'gpm update' first.")
+            self.logger.warn("Cache does not exist. Please run 'pkg update' first.")
             self.logger.info("Falling back to 'emerge --search' (slow)...")
-            return False # Fallback to slow search
+            return False
 
         try:
             with open(CACHE_FILE, 'r') as f:
@@ -124,7 +123,7 @@ class GPMCache:
             if not results:
                 self.logger.warn(f"No packages found matching '{keyword}' in cache.")
             else:
-                print(f"\n{GPMLogger.BOLD}Search Results (Cache Hit):{GPMLogger.ENDC}")
+                print(f"\n{PkgLogger.BOLD}Search Results (Cache Hit):{PkgLogger.ENDC}")
                 limit = 20
                 for i, p in enumerate(results):
                     if i >= limit:
@@ -137,14 +136,47 @@ class GPMCache:
             return False
 
 # --- 3. CORE ENGINE ---
-class GPMCore:
+class PkgCore:
     def __init__(self):
-        self.logger = GPMLogger()
-        self.cache = GPMCache(self.logger)
+        self.logger = PkgLogger()
+        self.cache = PkgCache(self.logger)
         self.config = self._load_config()
+
+    def _create_default_config(self):
+        """Tự động tạo file config mặc định nếu chưa có"""
+        try:
+            config_dir = os.path.dirname(CONFIG_FILE)
+            if not os.path.exists(config_dir):
+                os.makedirs(config_dir, exist_ok=True)
+
+            content = (
+                "# PKG Configuration File\n"
+                "# Generated automatically by PKG\n\n"
+                "# Number of compilation cores (or 'auto')\n"
+                "CORES=auto\n\n"
+                "# Automatically attempt to fix USE flags/masks\n"
+                "AUTOFIX=true\n\n"
+                "# Prevent removing system critical packages (basic check)\n"
+                "SAFE_MODE=true\n"
+            )
+            
+            with open(CONFIG_FILE, 'w') as f:
+                f.write(content)
+            
+            self.logger.info(f"Created default configuration at {CONFIG_FILE}")
+            
+        except PermissionError:
+            # Nếu chạy user thường thì không tạo được ở /etc, bỏ qua
+            pass
 
     def _load_config(self):
         defaults = {"CORES": "auto", "AUTOFIX": "true", "SAFE_MODE": "true"}
+        
+        # Kiểm tra file config, nếu không có thì tạo
+        if not os.path.exists(CONFIG_FILE):
+            self._create_default_config()
+
+        # Đọc lại file
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE) as f:
@@ -162,8 +194,6 @@ class GPMCore:
         return use_str.replace(",", " ")
 
     def run_process(self, cmd_args, env_vars=None, stream_output=True):
-        """Chạy lệnh hệ thống với Real-time Streaming log / Run system command with Real-time Streaming log"""
-        
         if env_vars is None:
             env_vars = {}
 
@@ -178,7 +208,7 @@ class GPMCore:
         if "MAKEOPTS" in env_vars:
             env_display += f"MAKEOPTS=\"{env_vars['MAKEOPTS']}\" "
             
-        self.logger.info(f"Executing: {GPMLogger.BOLD}{env_display}{cmd_str}{GPMLogger.ENDC}")
+        self.logger.info(f"Executing: {PkgLogger.BOLD}{env_display}{cmd_str}{PkgLogger.ENDC}")
 
         try:
             process = subprocess.Popen(
@@ -187,7 +217,7 @@ class GPMCore:
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
-                bufsize=1 # Line buffered
+                bufsize=1 
             )
 
             full_log = []
@@ -207,15 +237,14 @@ class GPMCore:
             return success, "".join(full_log)
 
         except KeyboardInterrupt:
-            print() # New line
+            print() 
             self.logger.warn("Process killed by user.")
             return False, ""
         except FileNotFoundError:
             self.logger.error(f"Command not found: {cmd_args[0]}")
             return False, ""
 
-    # --- MAIN COMMANDS (FIXED INPUT HANDLING) ---
-
+    # --- MAIN COMMANDS ---
     def install(self, packages, jobs=None, dry_run=False, use_flags=None):
         emerge_cmd = ["emerge", "--verbose"]
         
@@ -225,12 +254,10 @@ class GPMCore:
         
         emerge_cmd.extend(packages)
 
-        # [FIX] Hỏi user bằng Python thay vì để emerge --ask treo process
-        # [FIX] Ask user via Python instead of letting emerge --ask hang the process
         if not dry_run:
-            print(f"{GPMLogger.HEADER}Plan to install:{GPMLogger.ENDC} {', '.join(packages)}")
+            print(f"{PkgLogger.HEADER}Plan to install:{PkgLogger.ENDC} {', '.join(packages)}")
             try:
-                confirm = input(f"{GPMLogger.WARNING}Continue? (Y/n): {GPMLogger.ENDC}")
+                confirm = input(f"{PkgLogger.WARNING}Continue? (Y/n): {PkgLogger.ENDC}")
                 if confirm.lower() not in ['', 'y', 'yes']:
                     self.logger.warn("Aborted by user.")
                     return
@@ -255,19 +282,16 @@ class GPMCore:
             self._handle_error(output, emerge_cmd, env)
 
     def remove(self, packages, dry_run=False):
-        # [FIX] Removed --ask, added Python confirmation
         cmd = ["emerge", "--unmerge"] 
-        
         if dry_run:
             cmd.append("--pretend")
         
         cmd.extend(packages)
 
         if not dry_run:
-            print(f"{GPMLogger.HEADER}Plan to REMOVE:{GPMLogger.ENDC} {', '.join(packages)}")
+            print(f"{PkgLogger.HEADER}Plan to REMOVE:{PkgLogger.ENDC} {', '.join(packages)}")
             try:
-                # Mặc định là NO để an toàn / Default is NO for safety
-                confirm = input(f"{GPMLogger.FAIL}Are you sure? (This can break things) (y/N): {GPMLogger.ENDC}")
+                confirm = input(f"{PkgLogger.FAIL}Are you sure? (This can break things) (y/N): {PkgLogger.ENDC}")
                 if confirm.lower() not in ['y', 'yes']:
                     self.logger.warn("Aborted.")
                     return
@@ -289,9 +313,8 @@ class GPMCore:
         if dry_run:
             cmd.append("--pretend")
         elif not dry_run:
-            # Confirmation for upgrade
             try:
-                confirm = input(f"{GPMLogger.HEADER}Ready to upgrade system (@world). Continue? (Y/n): {GPMLogger.ENDC}")
+                confirm = input(f"{PkgLogger.HEADER}Ready to upgrade system (@world). Continue? (Y/n): {PkgLogger.ENDC}")
                 if confirm.lower() not in ['', 'y', 'yes']:
                     self.logger.warn("Aborted.")
                     return
@@ -316,9 +339,8 @@ class GPMCore:
             self.logger.warn("Detected missing USE flags / Keyword masking.")
             if self.config["AUTOFIX"] == "true":
                 try:
-                    ask = input(f"{GPMLogger.WARNING}Attempt automatic fix (autounmask)? (Y/n): {GPMLogger.ENDC}")
+                    ask = input(f"{PkgLogger.WARNING}Attempt automatic fix (autounmask)? (Y/n): {PkgLogger.ENDC}")
                     if ask.lower() in ["", "y"]:
-                        # Tự động fix thì không cần ask nữa / Auto fix doesn't need ask
                         new_cmd = ["emerge", "--autounmask-continue"] + original_cmd[1:] 
                         self.run_process(new_cmd, env)
                         self.logger.info("Please run 'dispatch-conf' if configuration changes are needed.")
@@ -327,58 +349,52 @@ class GPMCore:
 
 # --- MAIN CLI ---
 def main():
-    parser = argparse.ArgumentParser(description="GPM - Gentoo Package Manager (Advanced Wrapper)", add_help=False)
+    parser = argparse.ArgumentParser(description="PKG - Gentoo Package Manager (Wrapper)", add_help=False)
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # Install
     p_install = subparsers.add_parser("install", help="Install packages")
     p_install.add_argument("packages", nargs="+", help="List of packages")
     p_install.add_argument("-j", "--jobs", help="Number of compilation jobs")
     p_install.add_argument("--dry-run", action="store_true", help="Show plan only")
     p_install.add_argument("--use", type=str, help="Custom USE flags")
 
-    # Remove
     p_remove = subparsers.add_parser("remove", help="Remove packages")
     p_remove.add_argument("packages", nargs="+", help="List of packages")
     p_remove.add_argument("--dry-run", action="store_true", help="Simulation")
 
-    # Update
     subparsers.add_parser("update", help="Sync repositories and update Cache")
 
-    # Upgrade
     p_upgrade = subparsers.add_parser("upgrade", help="Upgrade system (@world)")
     p_upgrade.add_argument("-j", "--jobs", help="Number of compilation jobs")
     p_upgrade.add_argument("--dry-run", action="store_true", help="Simulation")
 
-    # Search
     p_search = subparsers.add_parser("search", help="Search packages")
     p_search.add_argument("query", help="Keyword")
 
-    # Help
-    p_help = subparsers.add_parser("help", help="Show help")
+    subparsers.add_parser("help", help="Show help")
 
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
 
     args = parser.parse_args()
-    gpm = GPMCore()
+    pkg = PkgCore()
 
     if args.command in ["install", "remove", "update", "upgrade"] and os.geteuid() != 0:
         if not getattr(args, 'dry_run', False):
-            gpm.logger.error("ROOT privileges (sudo) required to execute.")
+            pkg.logger.error("ROOT privileges (sudo) required to execute.")
             sys.exit(1)
 
     if args.command == "install":
-        gpm.install(args.packages, jobs=args.jobs, dry_run=args.dry_run, use_flags=args.use)
+        pkg.install(args.packages, jobs=args.jobs, dry_run=args.dry_run, use_flags=args.use)
     elif args.command == "remove":
-        gpm.remove(args.packages, dry_run=args.dry_run)
+        pkg.remove(args.packages, dry_run=args.dry_run)
     elif args.command == "update":
-        gpm.update_system()
+        pkg.update_system()
     elif args.command == "upgrade":
-        gpm.upgrade_world(jobs=args.jobs, dry_run=args.dry_run)
+        pkg.upgrade_world(jobs=args.jobs, dry_run=args.dry_run)
     elif args.command == "search":
-        gpm.search(args.query)
+        pkg.search(args.query)
     elif args.command == "help":
         parser.print_help()
 

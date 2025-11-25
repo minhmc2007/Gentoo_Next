@@ -1,0 +1,14 @@
+# /etc/os-release — Gentoo Linux Next
+NAME="Gentoo Linux Next"
+VERSION="beta"
+ID=gentoo-next
+ID_LIKE=gentoo
+PRETTY_NAME="Gentoo Linux Next (Beta)"
+VERSION_ID="0.x"
+VERSION_CODENAME="beta"
+BUILD_ID="git://github.com/minhmc2007/Gentoo_Linux_Next@main"
+HOME_URL="https://github.com/minhmc2007/Gentoo_Linux_Next"
+SUPPORT_URL="https://github.com/minhmc2007/Gentoo_Linux_Next/issues"
+BUG_REPORT_URL="https://github.com/minhmc2007/Gentoo_Linux_Next/issues"
+ANSI_COLOR="0;35"
+LOGO="gentoo-next"
