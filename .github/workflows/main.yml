@@ -25,10 +25,11 @@ jobs:
       run: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends \
+        # CRITICAL FIX: Added 'dracut-live' (for dmsquash-live) and 'busybox-static' (for shell)
+        apt-get install -y \
           wget squashfs-tools xorriso sed file \
           build-essential bc bison flex libelf-dev libssl-dev \
-          jq curl dracut kmod cpio ca-certificates xz-utils
+          jq curl dracut dracut-live kmod cpio ca-certificates xz-utils busybox-static
 
     - name: Prepare Workspace
       run: |
@@ -100,37 +101,34 @@ jobs:
     # --- PART 4: INTEGRATE KERNEL (FIXED) ---
     - name: Integrate New Kernel
       run: |
-        # 1. Detect the ACTUAL directory name (Handles localversion suffix)
+        # 1. Detect ACTUAL directory name
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
         
-        echo "Upstream Version: ${{ steps.kernel.outputs.version }}"
-        echo "Actual Kernel Dir: $FULL_KVER"
+        echo "Using Kernel Modules: $FULL_KVER"
         
         if [ -z "$FULL_KVER" ]; then
-            echo "CRITICAL ERROR: No module directory found in stage!"
+            echo "CRITICAL ERROR: No module directory found!"
             exit 1
         fi
         
-        # 2. Clean old modules from the SquashFS root
+        # 2. Clean old modules
         rm -rf squashfs-root/lib/modules/*
         
-        # 3. Inject NEW modules into SquashFS
+        # 3. Inject NEW modules
         echo "Copying modules to rootfs..."
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
         # 4. Generate Initramfs
-        # Copy modules to the host /lib/modules so dracut can find them
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
         echo "Generating initramfs with Dracut..."
-        # We must use FULL_KVER here so dracut looks in the right folder
+        # Added busybox module explicitly just in case
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --add "base dmsquash-live pollcdrom" \
+        --add "base dmsquash-live pollcdrom busybox" \
         --omit "lvm mdraid" \
         iso_content/boot/gentoo.igz
         
-        # Save the full version to output for the release step
         echo "full_version=$FULL_KVER" >> $GITHUB_ENV
 
     # --- PART 5: FIX BOOTLOADER ---
@@ -139,7 +137,7 @@ jobs:
         ORIG_LABEL=$(xorriso -indev base.iso -pvd_info 2>/dev/null | grep "Volume Id" | sed 's/.*: //' | tr -d ' ')
         if [ -z "$ORIG_LABEL" ]; then ORIG_LABEL="Gentoo-amd64-20251122"; fi
         
-        echo "Patching boot configs (Replacing $ORIG_LABEL with GENTOO_NEXT)..."
+        echo "Patching boot configs..."
         find iso_content -type f \( -name "*.cfg" -o -name "*.conf" \) -exec sed -i "s/$ORIG_LABEL/GENTOO_NEXT/g" {} +
 
     # --- PART 6: PACK ISO ---
@@ -181,7 +179,6 @@ jobs:
         body: |
           ### Gentoo Next Custom
           - **Kernel**: ${{ env.full_version }}
-          - **Config**: Custom User Config
         files: gentoo-next.iso
         prerelease: true
       env:
