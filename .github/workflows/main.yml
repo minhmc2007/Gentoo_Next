@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:latest
-      options: --privileged # Required for loopback mounting
+      options: --privileged
 
     steps:
     - name: Checkout Code
@@ -47,6 +47,9 @@ jobs:
         echo "Unpacking SquashFS..."
         unsquashfs -d squashfs-root iso_content/image.squashfs
         rm iso_content/image.squashfs
+        
+        # FIX: Make sure we can actually modify/delete files
+        chmod -R +w squashfs-root
 
     # --- PART 2: APPLY OVERLAY & FIXES ---
     - name: Apply System Overlay & Branding
@@ -69,16 +72,19 @@ jobs:
            sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
         fi
 
-        # 3. BRANDING: Update OpenRC Boot Message (/etc/issue)
+        # 3. BRANDING: Update OpenRC Boot Message
         echo "Updating Boot Banner..."
         sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue 2>/dev/null || true
         sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue.logo 2>/dev/null || true
         
-        # 4. BUGFIX: Remove Accessibility Services (Fixes 'speakup_soft not found' error)
-        echo "Removing speakup services..."
-        rm -f squashfs-root/etc/init.d/speakup squashfs-root/etc/init.d/espeakup 2>/dev/null || true
-        rm -f squashfs-root/etc/runlevels/*/speakup 2>/dev/null || true
-        rm -f squashfs-root/etc/runlevels/*/espeakup 2>/dev/null || true
+        # 4. BUGFIX: NUKE ACCESSIBILITY SERVICES
+        # We use 'find' to locate and delete anything named speakup to prevent the hang
+        echo "Nuking speakup services..."
+        find squashfs-root/etc -name "*speakup*" -print -delete
+        
+        # 5. BUGFIX: Blacklist the module just in case
+        mkdir -p squashfs-root/etc/modprobe.d
+        echo "blacklist speakup_soft" > squashfs-root/etc/modprobe.d/blacklist-speakup.conf
 
     # --- PART 3: COMPILE CUSTOM KERNEL ---
     - name: Fetch and Compile Custom Kernel
@@ -102,7 +108,6 @@ jobs:
         if [ -f ../config/kernel/config ]; then
           echo "Using custom configuration..."
           cp ../config/kernel/config .config
-          # Update config for new version defaults (preserves your settings)
           make olddefconfig
         else
           echo "CRITICAL ERROR: config/kernel/config not found!"
@@ -142,9 +147,9 @@ jobs:
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
         echo "Generating initramfs with Dracut..."
-        # Omit 'systemd' to prevent Ubuntu contamination
-        # Omit 'lvm/mdraid' to save space
-        # Add 'dmsquash-live' for ISO booting
+        # Omit systemd to prevent Ubuntu contamination
+        # Omit lvm/mdraid to save space
+        # Add dmsquash-live for ISO booting
         dracut --kver "$FULL_KVER" --force -N --xz \
         --omit "systemd systemd-initrd systemd-networkd systemd-journald lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
