@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:latest
-      options: --privileged
+      options: --privileged # Required for loopback mounting
 
     steps:
     - name: Checkout Code
@@ -25,7 +25,7 @@ jobs:
       run: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y \
+        apt-get install -y --no-install-recommends \
           wget squashfs-tools xorriso sed file \
           build-essential bc bison flex libelf-dev libssl-dev \
           jq curl dracut dracut-live kmod cpio ca-certificates xz-utils busybox-static
@@ -48,9 +48,10 @@ jobs:
         unsquashfs -d squashfs-root iso_content/image.squashfs
         rm iso_content/image.squashfs
 
-    # --- PART 2: APPLY OVERLAY ---
-    - name: Apply System Overlay
+    # --- PART 2: APPLY OVERLAY & FIXES ---
+    - name: Apply System Overlay & Branding
       run: |
+        # 1. Apply Overlay
         if [ -d "overlay" ]; then
           echo "Applying 'overlay/'..."
           cp -ruv overlay/* squashfs-root/
@@ -60,6 +61,24 @@ jobs:
         else
           echo "WARNING: No 'overlay' folder found."
         fi
+        
+        # 2. BRANDING: Update /etc/os-release
+        if [ -f squashfs-root/etc/os-release ]; then
+           sed -i 's/^NAME=.*/NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
+           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
+           sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
+        fi
+
+        # 3. BRANDING: Update OpenRC Boot Message (/etc/issue)
+        echo "Updating Boot Banner..."
+        sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue 2>/dev/null || true
+        sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue.logo 2>/dev/null || true
+        
+        # 4. BUGFIX: Remove Accessibility Services (Fixes 'speakup_soft not found' error)
+        echo "Removing speakup services..."
+        rm -f squashfs-root/etc/init.d/speakup squashfs-root/etc/init.d/espeakup 2>/dev/null || true
+        rm -f squashfs-root/etc/runlevels/*/speakup 2>/dev/null || true
+        rm -f squashfs-root/etc/runlevels/*/espeakup 2>/dev/null || true
 
     # --- PART 3: COMPILE CUSTOM KERNEL ---
     - name: Fetch and Compile Custom Kernel
@@ -79,28 +98,16 @@ jobs:
         tar -xf "linux-$KVER.tar.xz"
         cd "linux-$KVER"
         
-        # 1. Apply User Config
+        # Apply User Config
         if [ -f ../config/kernel/config ]; then
           echo "Using custom configuration..."
           cp ../config/kernel/config .config
+          # Update config for new version defaults (preserves your settings)
+          make olddefconfig
         else
           echo "CRITICAL ERROR: config/kernel/config not found!"
           exit 1
         fi
-        
-        # 2. FORCE CRITICAL ISO DRIVERS (Safety Net)
-        # This ensures the kernel can definitely read the ISO and Loopback
-        echo "Forcing Critical Config Options..."
-        ./scripts/config --enable CONFIG_BLK_DEV_LOOP
-        ./scripts/config --enable CONFIG_BLK_DEV_RAM
-        ./scripts/config --enable CONFIG_SQUASHFS
-        ./scripts/config --enable CONFIG_SQUASHFS_XZ
-        ./scripts/config --enable CONFIG_ISO9660_FS
-        ./scripts/config --enable CONFIG_OVERLAY_FS
-        ./scripts/config --enable CONFIG_DEVTMPFS
-        
-        # Update config
-        make olddefconfig
         
         echo "Compiling Kernel..."
         make -j$(nproc) bzImage modules
@@ -111,12 +118,11 @@ jobs:
         # Deploy bzImage
         cp arch/x86/boot/bzImage ../iso_content/boot/gentoo
 
-    # --- PART 4: INTEGRATE KERNEL (FIXED) ---
+    # --- PART 4: INTEGRATE KERNEL ---
     - name: Integrate New Kernel
       run: |
         # 1. Detect ACTUAL directory name
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
-        
         echo "Using Kernel Modules: $FULL_KVER"
         
         if [ -z "$FULL_KVER" ]; then
@@ -136,12 +142,12 @@ jobs:
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
         echo "Generating initramfs with Dracut..."
-        # --- DRACUT FIX IS HERE ---
-        # --omit "systemd..." removes the Ubuntu contamination
-        # --add "dmsquash-live" ensures ISO booting logic is present
+        # Omit 'systemd' to prevent Ubuntu contamination
+        # Omit 'lvm/mdraid' to save space
+        # Add 'dmsquash-live' for ISO booting
         dracut --kver "$FULL_KVER" --force -N --xz \
         --omit "systemd systemd-initrd systemd-networkd systemd-journald lvm mdraid multipath" \
-        --add "base bash dmsquash-live pollcdrom" \
+        --add "base bash dmsquash-live pollcdrom busybox" \
         iso_content/boot/gentoo.igz
         
         echo "full_version=$FULL_KVER" >> $GITHUB_ENV
@@ -194,6 +200,7 @@ jobs:
         body: |
           ### Gentoo Next Custom
           - **Kernel**: ${{ env.full_version }}
+          - **Config**: Custom User Config
         files: gentoo-next.iso
         prerelease: true
       env:
