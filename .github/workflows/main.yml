@@ -47,14 +47,11 @@ jobs:
         echo "Unpacking SquashFS..."
         unsquashfs -d squashfs-root iso_content/image.squashfs
         rm iso_content/image.squashfs
-        
-        # FIX: Make sure we can actually modify/delete files
         chmod -R +w squashfs-root
 
     # --- PART 2: APPLY OVERLAY & FIXES ---
     - name: Apply System Overlay & Branding
       run: |
-        # 1. Apply Overlay
         if [ -d "overlay" ]; then
           echo "Applying 'overlay/'..."
           cp -ruv overlay/* squashfs-root/
@@ -65,38 +62,20 @@ jobs:
           echo "WARNING: No 'overlay' folder found."
         fi
         
-        # 2. BRANDING: Update /etc/os-release
+        # Branding
         if [ -f squashfs-root/etc/os-release ]; then
            sed -i 's/^NAME=.*/NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
-           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
-           sed -i 's/^ID=.*/ID=gentoo-next/' squashfs-root/etc/os-release
         fi
-
-        # 3. BRANDING: Update OpenRC Boot Message
-        echo "Updating Boot Banner..."
         sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue 2>/dev/null || true
-        sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue.logo 2>/dev/null || true
         
-        # 4. BUGFIX: NUKE ACCESSIBILITY SERVICES
-        # We use 'find' to locate and delete anything named speakup to prevent the hang
-        echo "Nuking speakup services..."
-        find squashfs-root/etc -name "*speakup*" -print -delete
-        
-        # 5. BUGFIX: Blacklist the module just in case
-        mkdir -p squashfs-root/etc/modprobe.d
-        echo "blacklist speakup_soft" > squashfs-root/etc/modprobe.d/blacklist-speakup.conf
+        # Remove Accessibility Services (Prevents 'speakup' errors)
+        find squashfs-root/etc -name "*speakup*" -delete
 
     # --- PART 3: COMPILE CUSTOM KERNEL ---
     - name: Fetch and Compile Custom Kernel
       id: kernel
       run: |
         KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.latest_stable.version')
-        if [ -z "$KVER" ] || [ "$KVER" == "null" ]; then
-             echo "ERROR: Could not fetch kernel version."
-             exit 1
-        fi
-        
-        echo "Latest Stable Kernel: $KVER"
         echo "version=$KVER" >> $GITHUB_OUTPUT
         
         echo "Downloading Linux $KVER..."
@@ -104,9 +83,8 @@ jobs:
         tar -xf "linux-$KVER.tar.xz"
         cd "linux-$KVER"
         
-        # Apply User Config
+        # Check Config
         if [ -f ../config/kernel/config ]; then
-          echo "Using custom configuration..."
           cp ../config/kernel/config .config
           make olddefconfig
         else
@@ -120,13 +98,11 @@ jobs:
         echo "Installing modules to staging..."
         make INSTALL_MOD_PATH=../modules_stage modules_install
         
-        # Deploy bzImage
         cp arch/x86/boot/bzImage ../iso_content/boot/gentoo
 
-    # --- PART 4: INTEGRATE KERNEL ---
+    # --- PART 4: INTEGRATE KERNEL (CRITICAL FIXES HERE) ---
     - name: Integrate New Kernel
       run: |
-        # 1. Detect ACTUAL directory name
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
         echo "Using Kernel Modules: $FULL_KVER"
         
@@ -135,24 +111,28 @@ jobs:
             exit 1
         fi
         
-        # 2. Clean old modules
+        # 1. Clean old modules
         rm -rf squashfs-root/lib/modules/*
         
-        # 3. Inject NEW modules
-        echo "Copying modules to rootfs..."
+        # 2. Copy modules to ISO rootfs
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 4. Generate Initramfs
+        # 3. Setup modules for Dracut (Host /lib/modules)
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        echo "Generating initramfs with Dracut..."
-        # Omit systemd to prevent Ubuntu contamination
-        # Omit lvm/mdraid to save space
-        # Add dmsquash-live for ISO booting
+        # 4. REGENERATE MODULE DEPENDENCIES (The Fix for 'module not found')
+        echo "Regenerating module dependencies (depmod)..."
+        depmod -a -b / "$FULL_KVER"
+        
+        # 5. Generate Initramfs
+        echo "Generating initramfs..."
+        # We explicitly ADD drivers to ensure they aren't missed
+        # We explicitly OMIT udev-rules to kill the systemd infection
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --omit "systemd systemd-initrd systemd-networkd systemd-journald lvm mdraid multipath" \
+        --omit "systemd systemd-initrd systemd-networkd systemd-journald udev-rules lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
+        --add-drivers "squashfs loop overlay isofs cdrom sr_mod" \
         iso_content/boot/gentoo.igz
         
         echo "full_version=$FULL_KVER" >> $GITHUB_ENV
@@ -162,14 +142,11 @@ jobs:
       run: |
         ORIG_LABEL=$(xorriso -indev base.iso -pvd_info 2>/dev/null | grep "Volume Id" | sed 's/.*: //' | tr -d ' ')
         if [ -z "$ORIG_LABEL" ]; then ORIG_LABEL="Gentoo-amd64-20251122"; fi
-        
-        echo "Patching boot configs..."
         find iso_content -type f \( -name "*.cfg" -o -name "*.conf" \) -exec sed -i "s/$ORIG_LABEL/GENTOO_NEXT/g" {} +
 
     # --- PART 6: PACK ISO ---
     - name: Pack Final ISO
       run: |
-        echo "Squashing filesystem..."
         mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
         
         cd iso_content
@@ -177,7 +154,6 @@ jobs:
         if [ -z "$BIOS_IMG" ]; then BIOS_IMG=$(find boot/grub/i386-pc -name "*.img" | head -n 1); fi
         UEFI_IMG=$(find . -maxdepth 2 -name efi.img | sed 's|^\./||')
         
-        echo "Building ISO..."
         xorriso -as mkisofs \
            -iso-level 3 \
            -full-iso9660-filenames \
@@ -205,7 +181,7 @@ jobs:
         body: |
           ### Gentoo Next Custom
           - **Kernel**: ${{ env.full_version }}
-          - **Config**: Custom User Config
+          - **Fixes**: Depmod run, Systemd purged, SquashFS forced.
         files: gentoo-next.iso
         prerelease: true
       env:
