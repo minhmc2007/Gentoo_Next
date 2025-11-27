@@ -25,7 +25,6 @@ jobs:
       run: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        # CRITICAL FIX: Added 'dracut-live' (for dmsquash-live) and 'busybox-static' (for shell)
         apt-get install -y \
           wget squashfs-tools xorriso sed file \
           build-essential bc bison flex libelf-dev libssl-dev \
@@ -80,14 +79,28 @@ jobs:
         tar -xf "linux-$KVER.tar.xz"
         cd "linux-$KVER"
         
+        # 1. Apply User Config
         if [ -f ../config/kernel/config ]; then
           echo "Using custom configuration..."
           cp ../config/kernel/config .config
-          make olddefconfig
         else
           echo "CRITICAL ERROR: config/kernel/config not found!"
           exit 1
         fi
+        
+        # 2. FORCE CRITICAL ISO DRIVERS (Safety Net)
+        # This ensures the kernel can definitely read the ISO and Loopback
+        echo "Forcing Critical Config Options..."
+        ./scripts/config --enable CONFIG_BLK_DEV_LOOP
+        ./scripts/config --enable CONFIG_BLK_DEV_RAM
+        ./scripts/config --enable CONFIG_SQUASHFS
+        ./scripts/config --enable CONFIG_SQUASHFS_XZ
+        ./scripts/config --enable CONFIG_ISO9660_FS
+        ./scripts/config --enable CONFIG_OVERLAY_FS
+        ./scripts/config --enable CONFIG_DEVTMPFS
+        
+        # Update config
+        make olddefconfig
         
         echo "Compiling Kernel..."
         make -j$(nproc) bzImage modules
@@ -123,10 +136,12 @@ jobs:
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
         echo "Generating initramfs with Dracut..."
-        # Added busybox module explicitly just in case
+        # --- DRACUT FIX IS HERE ---
+        # --omit "systemd..." removes the Ubuntu contamination
+        # --add "dmsquash-live" ensures ISO booting logic is present
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --add "base dmsquash-live pollcdrom busybox" \
-        --omit "lvm mdraid" \
+        --omit "systemd systemd-initrd systemd-networkd systemd-journald lvm mdraid multipath" \
+        --add "base bash dmsquash-live pollcdrom" \
         iso_content/boot/gentoo.igz
         
         echo "full_version=$FULL_KVER" >> $GITHUB_ENV
