@@ -1,4 +1,4 @@
-name: Build Gentoo Linux Next
+name: Build Gentoo Linux Next (Arch Env)
 on:
   workflow_dispatch:
     inputs:
@@ -14,21 +14,26 @@ jobs:
   build-full:
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:latest
+      image: archlinux:latest
       options: --privileged
 
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install Build Dependencies
+    - name: Install Build Dependencies (Pacman)
       run: |
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y --no-install-recommends \
-          wget squashfs-tools xorriso sed file \
-          build-essential bc bison flex libelf-dev libssl-dev \
-          jq curl dracut dracut-live kmod cpio ca-certificates xz-utils busybox-static
+        # Initialize Pacman
+        pacman -Syu --noconfirm
+        
+        # Install Tools
+        # base-devel: includes gcc, make, bison, flex, etc.
+        # libisoburn: provides xorriso
+        # squashfs-tools: provides mksquashfs
+        pacman -S --noconfirm \
+          base-devel wget squashfs-tools libisoburn \
+          bc libelf openssl jq curl dracut cpio xz git \
+          kmod
 
     - name: Prepare Workspace
       run: |
@@ -68,7 +73,7 @@ jobs:
         fi
         sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue 2>/dev/null || true
         
-        # Remove Accessibility Services (Prevents 'speakup' errors)
+        # Remove Accessibility Services
         find squashfs-root/etc -name "*speakup*" -delete
 
     # --- PART 3: COMPILE CUSTOM KERNEL ---
@@ -100,7 +105,7 @@ jobs:
         
         cp arch/x86/boot/bzImage ../iso_content/boot/gentoo
 
-    # --- PART 4: INTEGRATE KERNEL (CRITICAL FIXES HERE) ---
+    # --- PART 4: INTEGRATE KERNEL ---
     - name: Integrate New Kernel
       run: |
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
@@ -117,18 +122,17 @@ jobs:
         # 2. Copy modules to ISO rootfs
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 3. Setup modules for Dracut (Host /lib/modules)
+        # 3. Setup modules for Dracut
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        # 4. REGENERATE MODULE DEPENDENCIES (The Fix for 'module not found')
+        # 4. REGENERATE MODULE DEPENDENCIES
         echo "Regenerating module dependencies (depmod)..."
         depmod -a -b / "$FULL_KVER"
         
         # 5. Generate Initramfs
         echo "Generating initramfs..."
-        # We explicitly ADD drivers to ensure they aren't missed
-        # We explicitly OMIT udev-rules to kill the systemd infection
+        # Arch Dracut is clean, but we still OMIT systemd just in case
         dracut --kver "$FULL_KVER" --force -N --xz \
         --omit "systemd systemd-initrd systemd-networkd systemd-journald udev-rules lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
@@ -179,9 +183,9 @@ jobs:
         tag_name: "v${{ github.run_number }}-kernel-${{ env.full_version }}"
         name: "Gentoo Next (Kernel ${{ env.full_version }})"
         body: |
-          ### Gentoo Next Custom
+          ### Gentoo Next Custom (Arch Build)
           - **Kernel**: ${{ env.full_version }}
-          - **Fixes**: Depmod run, Systemd purged, SquashFS forced.
+          - **Toolchain**: Arch Linux (Latest GCC)
         files: gentoo-next.iso
         prerelease: true
       env:
