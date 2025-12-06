@@ -23,16 +23,17 @@ jobs:
 
     - name: Install Build Dependencies (Alpine)
       run: |
-        # Enable community repo (needed for grub, xorriso, etc.)
         echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
         echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
         apk update
         
-        # Install Build Tools
-        # FIX: 'elfutils-dev' instead of 'libelf-dev'
+        # FIX: Added 'linux-headers' (Fixes asm/types.h error)
+        # FIX: Added 'gawk' (Kernel makefiles prefer GNU awk)
+        # FIX: Added 'ncurses-dev' (Useful for menuconfig/tools)
         apk add --no-cache \
           bash build-base git wget curl xz cpio \
           bison flex elfutils-dev openssl-dev \
+          linux-headers gawk ncurses-dev \
           squashfs-tools xorriso grub grub-bios grub-efi mtools dosfstools \
           dracut kmod jq sed
 
@@ -90,7 +91,6 @@ jobs:
     - name: Fetch and Compile Kernel
       id: kernel
       run: |
-        # Use bash explicitly for sourcing profile
         /bin/bash -c "source /etc/profile"
         
         KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.latest_stable.version')
@@ -108,12 +108,15 @@ jobs:
           exit 1
         fi
         
-        # FORCE CRITICAL CONFIGS (Safety Net)
-        # We use bash to run the config script because Alpine's sh is ash
+        # FORCE CRITICAL CONFIGS
         bash ./scripts/config --enable CONFIG_OVERLAY_FS
         bash ./scripts/config --enable CONFIG_SQUASHFS
         bash ./scripts/config --enable CONFIG_ISO9660_FS
         bash ./scripts/config --enable CONFIG_BLK_DEV_LOOP
+        
+        # Disable BPF/BTF to avoid more build errors on Alpine
+        bash ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+        bash ./scripts/config --disable CONFIG_BPF
         
         make olddefconfig
         
@@ -144,8 +147,6 @@ jobs:
         
         # 4. Dracut
         echo "Generating initramfs..."
-        # Alpine Dracut is pure. We omit udev-rules only if using mdev, but for Gentoo Stage3 (OpenRC),
-        # we usually want udev. We OMIT systemd stuff.
         dracut --kver "$FULL_KVER" --force -N --xz \
         --omit "systemd systemd-initrd systemd-networkd systemd-udevd lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
@@ -164,19 +165,16 @@ jobs:
         # 2. Create grub.cfg
         echo "Creating grub.cfg..."
         cat <<EOF > iso_build/boot/grub/grub.cfg
-        # Load Modules
         insmod all_video
         insmod gfxterm
         insmod jpeg
         insmod png
         
-        # Theme Setup
         background_image /boot/grub/splash.jpg
         set gfxmode=auto
         loadfont unicode
         terminal_output gfxterm
         
-        # Timeout
         set timeout=10
         set default=0
 
