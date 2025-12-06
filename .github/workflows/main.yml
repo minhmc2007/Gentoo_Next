@@ -24,7 +24,7 @@ jobs:
     - name: Install Build Dependencies (Arch)
       run: |
         pacman -Syu --noconfirm
-        # We need grub, mtools, and libisoburn to generate the ISO bootloader from scratch
+        # grub, mtools, libisoburn: needed for bootloader generation
         pacman -S --noconfirm \
           base-devel wget squashfs-tools libisoburn \
           bc libelf openssl jq curl dracut cpio xz git \
@@ -35,21 +35,22 @@ jobs:
         mkdir -p build_area
         mkdir -p modules_stage
         mkdir -p iso_build/boot/grub
+        # Create LiveOS directory for the rootfs image
+        mkdir -p iso_build/LiveOS
 
     # --- PART 1: GET STAGE 3 ROOTFS ---
     - name: Download & Unpack Stage 3
       run: |
         echo "Downloading Gentoo Stage 3 OpenRC..."
-        # Using the specific link you requested
         wget -q --show-progress -O stage3.tar.xz "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251130T164554Z/stage3-amd64-openrc-20251130T164554Z.tar.xz"
         
         echo "Creating Root Filesystem..."
         mkdir -p squashfs-root
         
-        echo "Extracting Stage 3 (This preserves permissions)..."
+        echo "Extracting Stage 3..."
         tar xpf stage3.tar.xz -C squashfs-root --numeric-owner
         
-        # CLEANUP: Remove files we don't need for a LiveCD to save space
+        # CLEANUP: Save space
         rm -rf squashfs-root/usr/share/doc
         rm -rf squashfs-root/usr/share/man
         rm -rf squashfs-root/var/db/repos/gentoo
@@ -71,15 +72,13 @@ jobs:
            sed -i 's/^NAME=.*/NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
            sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
         fi
-        echo "Gentoo Linux Next \n \l" > squashfs-root/etc/issue
+        echo "Gentoo Linux Next" > squashfs-root/etc/issue
         
-        # 3. ROOT PASSWORD (CRITICAL for Stage 3)
-        # Stage 3 has a locked root account. We must unlock it.
-        # This command removes the '!' or '*' from shadow, making the password empty.
+        # 3. ROOT PASSWORD (Force Empty)
         sed -i 's/^root:[^:]*:/root::/' squashfs-root/etc/shadow
         
-        # 4. Enable Critical Services (OpenRC)
-        # Since we are in a container, we just create the symlinks manually
+        # 4. Enable Critical Services
+        # Symlink udev manually since we are offline
         ln -sf /etc/init.d/udev squashfs-root/etc/runlevels/sysinit/udev || true
         ln -sf /etc/init.d/udev-trigger squashfs-root/etc/runlevels/sysinit/udev-trigger || true
 
@@ -122,18 +121,19 @@ jobs:
         rm -rf squashfs-root/lib/modules/*
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 2. Setup Dracut Environment
+        # 2. Setup Dracut Environment (Host /lib/modules)
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        # 3. Depmod
+        # 3. Depmod (Crucial!)
         depmod -a -b / "$FULL_KVER"
         
         # 4. Dracut
         echo "Generating initramfs..."
-        # We need dmsquash-live to handle the squashfs boot
+        # FIX: Do NOT omit udev-rules (Base needs it). 
+        # FIX: Omit systemd-battery-check and dracut-systemd to fix dependency errors.
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --omit "systemd systemd-initrd systemd-networkd udev-rules lvm mdraid multipath" \
+        --omit "systemd systemd-initrd systemd-networkd systemd-journald systemd-battery-check dracut-systemd lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
         --add-drivers "squashfs loop overlay isofs cdrom sr_mod" \
         iso_build/boot/initramfs.img
@@ -180,11 +180,12 @@ jobs:
     - name: Pack Final ISO
       run: |
         echo "Squashing Root Filesystem..."
-        # Mksquashfs the Stage 3 root into the ISO folder
+        # Mksquashfs the Stage 3 root into the LiveOS/rootfs.img file
+        # This is the standard path Dracut dmsquash-live looks for
         mksquashfs squashfs-root iso_build/LiveOS/rootfs.img -comp gzip -noappend
         
         echo "Generating Hybrid ISO with grub-mkrescue..."
-        # grub-mkrescue handles the BIOS/EFI magic for us
+        # grub-mkrescue builds the ISO and handles BIOS/EFI boot sectors automatically
         grub-mkrescue -o gentoo-next.iso iso_build \
           --volid "GENTOO_NEXT" \
           --product-name "Gentoo Linux Next" \
@@ -206,7 +207,7 @@ jobs:
           ### Gentoo Linux Next
           - **Base**: Stage 3 OpenRC
           - **Kernel**: ${{ env.full_version }}
-          - **Build**: From Scratch (grub-mkrescue)
+          - **Boot**: GRUB + Custom Wallpaper
         files: gentoo-next.iso
         prerelease: true
       env:
