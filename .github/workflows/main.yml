@@ -27,9 +27,6 @@ jobs:
         echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
         apk update
         
-        # FIX: Added 'linux-headers' (Fixes asm/types.h error)
-        # FIX: Added 'gawk' (Kernel makefiles prefer GNU awk)
-        # FIX: Added 'ncurses-dev' (Useful for menuconfig/tools)
         apk add --no-cache \
           bash build-base git wget curl xz cpio \
           bison flex elfutils-dev openssl-dev \
@@ -52,8 +49,6 @@ jobs:
         
         echo "Creating Root Filesystem..."
         mkdir -p squashfs-root
-        
-        echo "Extracting Stage 3..."
         tar xpf stage3.tar.xz -C squashfs-root --numeric-owner
         
         # CLEANUP
@@ -64,7 +59,6 @@ jobs:
     # --- PART 2: APPLY OVERLAY & CONFIG ---
     - name: Configure System
       run: |
-        # 1. Apply User Overlay
         if [ -d "overlay" ]; then
           echo "Applying 'overlay/'..."
           cp -ruv overlay/* squashfs-root/
@@ -73,17 +67,17 @@ jobs:
           fi
         fi
         
-        # 2. Branding
+        # Branding
         if [ -f squashfs-root/etc/os-release ]; then
            sed -i 's/^NAME=.*/NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
            sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
         fi
         echo "Gentoo Linux Next" > squashfs-root/etc/issue
         
-        # 3. ROOT PASSWORD (Force Empty)
+        # ROOT PASSWORD
         sed -i 's/^root:[^:]*:/root::/' squashfs-root/etc/shadow
         
-        # 4. Enable Critical Services
+        # Services
         ln -sf /etc/init.d/udev squashfs-root/etc/runlevels/sysinit/udev || true
         ln -sf /etc/init.d/udev-trigger squashfs-root/etc/runlevels/sysinit/udev-trigger || true
 
@@ -108,20 +102,23 @@ jobs:
           exit 1
         fi
         
-        # FORCE CRITICAL CONFIGS
+        # --- RAM SAVING CONFIGURATION ---
+        # 1. Disable Debug Info (Saves ~4GB RAM during link)
+        bash ./scripts/config --disable CONFIG_DEBUG_INFO
+        bash ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+        bash ./scripts/config --disable CONFIG_DEBUG_INFO_DWARF4
+        bash ./scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
+        
+        # 2. Force Critical Drivers
         bash ./scripts/config --enable CONFIG_OVERLAY_FS
         bash ./scripts/config --enable CONFIG_SQUASHFS
         bash ./scripts/config --enable CONFIG_ISO9660_FS
         bash ./scripts/config --enable CONFIG_BLK_DEV_LOOP
         
-        # Disable BPF/BTF to avoid more build errors on Alpine
-        bash ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
-        bash ./scripts/config --disable CONFIG_BPF
-        
         make olddefconfig
         
         echo "Compiling Kernel..."
-        make -j$(nproc) bzImage modules
+        make -j4 bzImage modules
         
         echo "Installing modules..."
         make INSTALL_MOD_PATH=../modules_stage modules_install
@@ -134,18 +131,14 @@ jobs:
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
         echo "Using Kernel Modules: $FULL_KVER"
         
-        # 1. Install Modules into RootFS
         rm -rf squashfs-root/lib/modules/*
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 2. Setup Dracut Environment
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        # 3. Depmod
         depmod -a -b / "$FULL_KVER"
         
-        # 4. Dracut
         echo "Generating initramfs..."
         dracut --kver "$FULL_KVER" --force -N --xz \
         --omit "systemd systemd-initrd systemd-networkd systemd-udevd lvm mdraid multipath" \
@@ -158,23 +151,17 @@ jobs:
     # --- PART 5: CONSTRUCT ISO & BOOTLOADER ---
     - name: Configure GRUB & Wallpaper
       run: |
-        # 1. Download Wallpaper
-        echo "Downloading Wallpaper..."
         wget -q -O iso_build/boot/grub/splash.jpg "https://c4.wallpaperflare.com/wallpaper/897/820/61/gentoo-linux-mint-unix-linux-hd-wallpaper-preview.jpg"
         
-        # 2. Create grub.cfg
-        echo "Creating grub.cfg..."
         cat <<EOF > iso_build/boot/grub/grub.cfg
         insmod all_video
         insmod gfxterm
         insmod jpeg
         insmod png
-        
         background_image /boot/grub/splash.jpg
         set gfxmode=auto
         loadfont unicode
         terminal_output gfxterm
-        
         set timeout=10
         set default=0
 
@@ -191,10 +178,8 @@ jobs:
 
     - name: Pack Final ISO
       run: |
-        echo "Squashing Root Filesystem..."
         mksquashfs squashfs-root iso_build/LiveOS/rootfs.img -comp gzip -noappend
         
-        echo "Generating Hybrid ISO with grub-mkrescue..."
         grub-mkrescue -o gentoo-next.iso iso_build \
           --volid "GENTOO_NEXT" \
           --product-name "Gentoo Linux Next" \
