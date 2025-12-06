@@ -1,4 +1,4 @@
-name: Build Gentoo Linux Next
+name: Build Gentoo Linux Next (Alpine Builder)
 on:
   workflow_dispatch:
     inputs:
@@ -14,28 +14,33 @@ jobs:
   build-full:
     runs-on: ubuntu-latest
     container:
-      image: archlinux:latest
+      image: alpine:latest
       options: --privileged
 
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install Build Dependencies (Arch)
+    - name: Install Build Dependencies (Alpine)
       run: |
-        pacman -Syu --noconfirm
-        # grub, mtools, libisoburn: needed for bootloader generation
-        pacman -S --noconfirm \
-          base-devel wget squashfs-tools libisoburn \
-          bc libelf openssl jq curl dracut cpio xz git \
-          kmod grub mtools dosfstools
+        # Enable community repo for some tools
+        echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+        apk update
+        
+        # Install Build Tools
+        # Alpine uses 'build-base' instead of build-essential
+        # 'xorriso' is often in community
+        apk add --no-cache \
+          bash build-base git wget curl xz cpio \
+          bison flex libelf-dev openssl-dev \
+          squashfs-tools xorriso grub-bios grub-efi mtools dosfstools \
+          dracut kmod jq sed
 
     - name: Prepare Workspace
       run: |
         mkdir -p build_area
         mkdir -p modules_stage
         mkdir -p iso_build/boot/grub
-        # Create LiveOS directory for the rootfs image
         mkdir -p iso_build/LiveOS
 
     # --- PART 1: GET STAGE 3 ROOTFS ---
@@ -48,9 +53,10 @@ jobs:
         mkdir -p squashfs-root
         
         echo "Extracting Stage 3..."
+        # Alpine tar handles xz automatically
         tar xpf stage3.tar.xz -C squashfs-root --numeric-owner
         
-        # CLEANUP: Save space
+        # CLEANUP
         rm -rf squashfs-root/usr/share/doc
         rm -rf squashfs-root/usr/share/man
         rm -rf squashfs-root/var/db/repos/gentoo
@@ -77,8 +83,7 @@ jobs:
         # 3. ROOT PASSWORD (Force Empty)
         sed -i 's/^root:[^:]*:/root::/' squashfs-root/etc/shadow
         
-        # 4. Enable Critical Services
-        # Symlink udev manually since we are offline
+        # 4. Enable Critical Services (Manual Symlinks for OpenRC)
         ln -sf /etc/init.d/udev squashfs-root/etc/runlevels/sysinit/udev || true
         ln -sf /etc/init.d/udev-trigger squashfs-root/etc/runlevels/sysinit/udev-trigger || true
 
@@ -86,6 +91,9 @@ jobs:
     - name: Fetch and Compile Kernel
       id: kernel
       run: |
+        # Alpine needs bash for this syntax
+        source /etc/profile
+        
         KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.latest_stable.version')
         echo "version=$KVER" >> $GITHUB_OUTPUT
         
@@ -96,11 +104,19 @@ jobs:
         
         if [ -f ../config/kernel/config ]; then
           cp ../config/kernel/config .config
-          make olddefconfig
         else
           echo "CRITICAL ERROR: config/kernel/config not found!"
           exit 1
         fi
+        
+        # FORCE CRITICAL CONFIGS
+        # The 'overlayfs' error you saw happens if this is missing
+        ./scripts/config --enable CONFIG_OVERLAY_FS
+        ./scripts/config --enable CONFIG_SQUASHFS
+        ./scripts/config --enable CONFIG_ISO9660_FS
+        ./scripts/config --enable CONFIG_BLK_DEV_LOOP
+        
+        make olddefconfig
         
         echo "Compiling Kernel..."
         make -j$(nproc) bzImage modules
@@ -108,7 +124,6 @@ jobs:
         echo "Installing modules..."
         make INSTALL_MOD_PATH=../modules_stage modules_install
         
-        # Copy kernel to ISO build area
         cp arch/x86/boot/bzImage ../iso_build/boot/kernel
 
     # --- PART 4: INTEGRATE KERNEL & DRACUT ---
@@ -121,7 +136,7 @@ jobs:
         rm -rf squashfs-root/lib/modules/*
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 2. Setup Dracut Environment (Host /lib/modules)
+        # 2. Setup Dracut Environment
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
@@ -130,10 +145,10 @@ jobs:
         
         # 4. Dracut
         echo "Generating initramfs..."
-        # FIX: Do NOT omit udev-rules (Base needs it). 
-        # FIX: Omit systemd-battery-check and dracut-systemd to fix dependency errors.
+        # Alpine Dracut is clean, but we omit just to be safe.
+        # Note: 'base' module in Alpine Dracut is usually robust.
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --omit "systemd systemd-initrd systemd-networkd systemd-journald systemd-battery-check dracut-systemd lvm mdraid multipath" \
+        --omit "systemd systemd-initrd systemd-networkd udev-rules lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
         --add-drivers "squashfs loop overlay isofs cdrom sr_mod" \
         iso_build/boot/initramfs.img
@@ -180,12 +195,9 @@ jobs:
     - name: Pack Final ISO
       run: |
         echo "Squashing Root Filesystem..."
-        # Mksquashfs the Stage 3 root into the LiveOS/rootfs.img file
-        # This is the standard path Dracut dmsquash-live looks for
         mksquashfs squashfs-root iso_build/LiveOS/rootfs.img -comp gzip -noappend
         
         echo "Generating Hybrid ISO with grub-mkrescue..."
-        # grub-mkrescue builds the ISO and handles BIOS/EFI boot sectors automatically
         grub-mkrescue -o gentoo-next.iso iso_build \
           --volid "GENTOO_NEXT" \
           --product-name "Gentoo Linux Next" \
@@ -207,7 +219,7 @@ jobs:
           ### Gentoo Linux Next
           - **Base**: Stage 3 OpenRC
           - **Kernel**: ${{ env.full_version }}
-          - **Boot**: GRUB + Custom Wallpaper
+          - **Builder**: Alpine Linux (Systemd-free)
         files: gentoo-next.iso
         prerelease: true
       env:
