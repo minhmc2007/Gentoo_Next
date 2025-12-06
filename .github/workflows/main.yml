@@ -1,4 +1,4 @@
-name: Build Gentoo Linux Next (Arch Env)
+name: Build Gentoo Linux Next
 on:
   workflow_dispatch:
     inputs:
@@ -21,63 +21,70 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install Build Dependencies (Pacman)
+    - name: Install Build Dependencies (Arch)
       run: |
-        # Initialize Pacman
         pacman -Syu --noconfirm
-        
-        # Install Tools
-        # base-devel: includes gcc, make, bison, flex, etc.
-        # libisoburn: provides xorriso
-        # squashfs-tools: provides mksquashfs
+        # We need grub, mtools, and libisoburn to generate the ISO bootloader from scratch
         pacman -S --noconfirm \
           base-devel wget squashfs-tools libisoburn \
           bc libelf openssl jq curl dracut cpio xz git \
-          kmod
+          kmod grub mtools dosfstools
 
     - name: Prepare Workspace
       run: |
         mkdir -p build_area
         mkdir -p modules_stage
+        mkdir -p iso_build/boot/grub
 
-    # --- PART 1: GET BASE ISO ---
-    - name: Download Base Gentoo ISO
+    # --- PART 1: GET STAGE 3 ROOTFS ---
+    - name: Download & Unpack Stage 3
       run: |
-        echo "Downloading Minimal ISO..."
-        wget -q --show-progress -O base.iso "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251122T160055Z/install-amd64-minimal-20251122T160055Z.iso"
+        echo "Downloading Gentoo Stage 3 OpenRC..."
+        # Using the specific link you requested
+        wget -q --show-progress -O stage3.tar.xz "https://distfiles.gentoo.org/releases/amd64/autobuilds/20251130T164554Z/stage3-amd64-openrc-20251130T164554Z.tar.xz"
         
-        echo "Extracting ISO..."
-        xorriso -osirrox on -indev base.iso -extract / iso_content
+        echo "Creating Root Filesystem..."
+        mkdir -p squashfs-root
         
-        echo "Unpacking SquashFS..."
-        unsquashfs -d squashfs-root iso_content/image.squashfs
-        rm iso_content/image.squashfs
-        chmod -R +w squashfs-root
+        echo "Extracting Stage 3 (This preserves permissions)..."
+        tar xpf stage3.tar.xz -C squashfs-root --numeric-owner
+        
+        # CLEANUP: Remove files we don't need for a LiveCD to save space
+        rm -rf squashfs-root/usr/share/doc
+        rm -rf squashfs-root/usr/share/man
+        rm -rf squashfs-root/var/db/repos/gentoo
 
-    # --- PART 2: APPLY OVERLAY & FIXES ---
-    - name: Apply System Overlay & Branding
+    # --- PART 2: APPLY OVERLAY & CONFIG ---
+    - name: Configure System
       run: |
+        # 1. Apply User Overlay
         if [ -d "overlay" ]; then
           echo "Applying 'overlay/'..."
           cp -ruv overlay/* squashfs-root/
           if [ -f squashfs-root/usr/bin/pkg ]; then
             chmod +x squashfs-root/usr/bin/pkg
           fi
-        else
-          echo "WARNING: No 'overlay' folder found."
         fi
         
-        # Branding
+        # 2. Branding
         if [ -f squashfs-root/etc/os-release ]; then
            sed -i 's/^NAME=.*/NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
+           sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Gentoo Linux Next"/' squashfs-root/etc/os-release
         fi
-        sed -i 's/Gentoo Linux/Gentoo Linux Next/g' squashfs-root/etc/issue 2>/dev/null || true
+        echo "Gentoo Linux Next \n \l" > squashfs-root/etc/issue
         
-        # Remove Accessibility Services
-        find squashfs-root/etc -name "*speakup*" -delete
+        # 3. ROOT PASSWORD (CRITICAL for Stage 3)
+        # Stage 3 has a locked root account. We must unlock it.
+        # This command removes the '!' or '*' from shadow, making the password empty.
+        sed -i 's/^root:[^:]*:/root::/' squashfs-root/etc/shadow
+        
+        # 4. Enable Critical Services (OpenRC)
+        # Since we are in a container, we just create the symlinks manually
+        ln -sf /etc/init.d/udev squashfs-root/etc/runlevels/sysinit/udev || true
+        ln -sf /etc/init.d/udev-trigger squashfs-root/etc/runlevels/sysinit/udev-trigger || true
 
     # --- PART 3: COMPILE CUSTOM KERNEL ---
-    - name: Fetch and Compile Custom Kernel
+    - name: Fetch and Compile Kernel
       id: kernel
       run: |
         KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.latest_stable.version')
@@ -88,7 +95,6 @@ jobs:
         tar -xf "linux-$KVER.tar.xz"
         cd "linux-$KVER"
         
-        # Check Config
         if [ -f ../config/kernel/config ]; then
           cp ../config/kernel/config .config
           make olddefconfig
@@ -100,92 +106,107 @@ jobs:
         echo "Compiling Kernel..."
         make -j$(nproc) bzImage modules
         
-        echo "Installing modules to staging..."
+        echo "Installing modules..."
         make INSTALL_MOD_PATH=../modules_stage modules_install
         
-        cp arch/x86/boot/bzImage ../iso_content/boot/gentoo
+        # Copy kernel to ISO build area
+        cp arch/x86/boot/bzImage ../iso_build/boot/kernel
 
-    # --- PART 4: INTEGRATE KERNEL ---
-    - name: Integrate New Kernel
+    # --- PART 4: INTEGRATE KERNEL & DRACUT ---
+    - name: Generate Initramfs
       run: |
         FULL_KVER=$(ls modules_stage/lib/modules/ | head -n 1)
         echo "Using Kernel Modules: $FULL_KVER"
         
-        if [ -z "$FULL_KVER" ]; then
-            echo "CRITICAL ERROR: No module directory found!"
-            exit 1
-        fi
-        
-        # 1. Clean old modules
+        # 1. Install Modules into RootFS
         rm -rf squashfs-root/lib/modules/*
-        
-        # 2. Copy modules to ISO rootfs
         cp -r modules_stage/lib/modules/* squashfs-root/lib/modules/
         
-        # 3. Setup modules for Dracut
+        # 2. Setup Dracut Environment
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        # 4. REGENERATE MODULE DEPENDENCIES
-        echo "Regenerating module dependencies (depmod)..."
+        # 3. Depmod
         depmod -a -b / "$FULL_KVER"
         
-        # 5. Generate Initramfs
+        # 4. Dracut
         echo "Generating initramfs..."
-        # Arch Dracut is clean, but we still OMIT systemd just in case
+        # We need dmsquash-live to handle the squashfs boot
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --omit "systemd systemd-initrd systemd-networkd systemd-journald udev-rules lvm mdraid multipath" \
+        --omit "systemd systemd-initrd systemd-networkd udev-rules lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
         --add-drivers "squashfs loop overlay isofs cdrom sr_mod" \
-        iso_content/boot/gentoo.igz
+        iso_build/boot/initramfs.img
         
         echo "full_version=$FULL_KVER" >> $GITHUB_ENV
 
-    # --- PART 5: FIX BOOTLOADER ---
-    - name: Fix Bootloader Config
+    # --- PART 5: CONSTRUCT ISO & BOOTLOADER ---
+    - name: Configure GRUB & Wallpaper
       run: |
-        ORIG_LABEL=$(xorriso -indev base.iso -pvd_info 2>/dev/null | grep "Volume Id" | sed 's/.*: //' | tr -d ' ')
-        if [ -z "$ORIG_LABEL" ]; then ORIG_LABEL="Gentoo-amd64-20251122"; fi
-        find iso_content -type f \( -name "*.cfg" -o -name "*.conf" \) -exec sed -i "s/$ORIG_LABEL/GENTOO_NEXT/g" {} +
+        # 1. Download Wallpaper
+        echo "Downloading Wallpaper..."
+        wget -q -O iso_build/boot/grub/splash.jpg "https://c4.wallpaperflare.com/wallpaper/897/820/61/gentoo-linux-mint-unix-linux-hd-wallpaper-preview.jpg"
+        
+        # 2. Create grub.cfg
+        echo "Creating grub.cfg..."
+        cat <<EOF > iso_build/boot/grub/grub.cfg
+        # Load Modules
+        insmod all_video
+        insmod gfxterm
+        insmod jpeg
+        insmod png
+        
+        # Theme Setup
+        background_image /boot/grub/splash.jpg
+        set gfxmode=auto
+        loadfont unicode
+        terminal_output gfxterm
+        
+        # Timeout
+        set timeout=10
+        set default=0
 
-    # --- PART 6: PACK ISO ---
+        menuentry "Gentoo Linux Next" {
+            linux /boot/kernel root=live:CDLABEL=GENTOO_NEXT rd.live.image rd.live.overlay console=tty0
+            initrd /boot/initramfs.img
+        }
+        
+        menuentry "Gentoo Linux Next (Ramdisk Mode)" {
+            linux /boot/kernel root=live:CDLABEL=GENTOO_NEXT rd.live.image rd.live.ram=1 console=tty0
+            initrd /boot/initramfs.img
+        }
+        EOF
+
     - name: Pack Final ISO
       run: |
-        mksquashfs squashfs-root iso_content/image.squashfs -comp gzip -noappend
+        echo "Squashing Root Filesystem..."
+        # Mksquashfs the Stage 3 root into the ISO folder
+        mksquashfs squashfs-root iso_build/LiveOS/rootfs.img -comp gzip -noappend
         
-        cd iso_content
-        BIOS_IMG=$(find boot/grub -name eltorito.img)
-        if [ -z "$BIOS_IMG" ]; then BIOS_IMG=$(find boot/grub/i386-pc -name "*.img" | head -n 1); fi
-        UEFI_IMG=$(find . -maxdepth 2 -name efi.img | sed 's|^\./||')
-        
-        xorriso -as mkisofs \
-           -iso-level 3 \
-           -full-iso9660-filenames \
-           -volid "GENTOO_NEXT" \
-           -eltorito-boot "$BIOS_IMG" \
-           -no-emul-boot -boot-load-size 4 -boot-info-table \
-           -eltorito-alt-boot \
-           -e "$UEFI_IMG" \
-           -no-emul-boot -isohybrid-gpt-basdat \
-           -output ../gentoo-next.iso \
-           .
+        echo "Generating Hybrid ISO with grub-mkrescue..."
+        # grub-mkrescue handles the BIOS/EFI magic for us
+        grub-mkrescue -o gentoo-next.iso iso_build \
+          --volid "GENTOO_NEXT" \
+          --product-name "Gentoo Linux Next" \
+          --product-version "${{ env.full_version }}"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: gentoo-next-custom-kernel
+        name: gentoo-next-stage3
         path: gentoo-next.iso
 
     - name: Create Release
       if: ${{ inputs.create_release == true }}
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: "v${{ github.run_number }}-kernel-${{ env.full_version }}"
-        name: "Gentoo Next (Kernel ${{ env.full_version }})"
+        tag_name: "v${{ github.run_number }}-stage3"
+        name: "Gentoo Next (From Scratch)"
         body: |
-          ### Gentoo Next Custom (Arch Build)
+          ### Gentoo Linux Next
+          - **Base**: Stage 3 OpenRC
           - **Kernel**: ${{ env.full_version }}
-          - **Toolchain**: Arch Linux (Latest GCC)
+          - **Build**: From Scratch (grub-mkrescue)
         files: gentoo-next.iso
         prerelease: true
       env:
