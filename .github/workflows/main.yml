@@ -23,17 +23,17 @@ jobs:
 
     - name: Install Build Dependencies (Alpine)
       run: |
-        # Enable community repo for some tools
+        # Enable community repo (needed for grub, xorriso, etc.)
         echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+        echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
         apk update
         
         # Install Build Tools
-        # Alpine uses 'build-base' instead of build-essential
-        # 'xorriso' is often in community
+        # FIX: 'elfutils-dev' instead of 'libelf-dev'
         apk add --no-cache \
           bash build-base git wget curl xz cpio \
-          bison flex libelf-dev openssl-dev \
-          squashfs-tools xorriso grub-bios grub-efi mtools dosfstools \
+          bison flex elfutils-dev openssl-dev \
+          squashfs-tools xorriso grub grub-bios grub-efi mtools dosfstools \
           dracut kmod jq sed
 
     - name: Prepare Workspace
@@ -53,7 +53,6 @@ jobs:
         mkdir -p squashfs-root
         
         echo "Extracting Stage 3..."
-        # Alpine tar handles xz automatically
         tar xpf stage3.tar.xz -C squashfs-root --numeric-owner
         
         # CLEANUP
@@ -83,7 +82,7 @@ jobs:
         # 3. ROOT PASSWORD (Force Empty)
         sed -i 's/^root:[^:]*:/root::/' squashfs-root/etc/shadow
         
-        # 4. Enable Critical Services (Manual Symlinks for OpenRC)
+        # 4. Enable Critical Services
         ln -sf /etc/init.d/udev squashfs-root/etc/runlevels/sysinit/udev || true
         ln -sf /etc/init.d/udev-trigger squashfs-root/etc/runlevels/sysinit/udev-trigger || true
 
@@ -91,8 +90,8 @@ jobs:
     - name: Fetch and Compile Kernel
       id: kernel
       run: |
-        # Alpine needs bash for this syntax
-        source /etc/profile
+        # Use bash explicitly for sourcing profile
+        /bin/bash -c "source /etc/profile"
         
         KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.latest_stable.version')
         echo "version=$KVER" >> $GITHUB_OUTPUT
@@ -109,12 +108,12 @@ jobs:
           exit 1
         fi
         
-        # FORCE CRITICAL CONFIGS
-        # The 'overlayfs' error you saw happens if this is missing
-        ./scripts/config --enable CONFIG_OVERLAY_FS
-        ./scripts/config --enable CONFIG_SQUASHFS
-        ./scripts/config --enable CONFIG_ISO9660_FS
-        ./scripts/config --enable CONFIG_BLK_DEV_LOOP
+        # FORCE CRITICAL CONFIGS (Safety Net)
+        # We use bash to run the config script because Alpine's sh is ash
+        bash ./scripts/config --enable CONFIG_OVERLAY_FS
+        bash ./scripts/config --enable CONFIG_SQUASHFS
+        bash ./scripts/config --enable CONFIG_ISO9660_FS
+        bash ./scripts/config --enable CONFIG_BLK_DEV_LOOP
         
         make olddefconfig
         
@@ -140,15 +139,15 @@ jobs:
         mkdir -p /lib/modules
         cp -r modules_stage/lib/modules/$FULL_KVER /lib/modules/
         
-        # 3. Depmod (Crucial!)
+        # 3. Depmod
         depmod -a -b / "$FULL_KVER"
         
         # 4. Dracut
         echo "Generating initramfs..."
-        # Alpine Dracut is clean, but we omit just to be safe.
-        # Note: 'base' module in Alpine Dracut is usually robust.
+        # Alpine Dracut is pure. We omit udev-rules only if using mdev, but for Gentoo Stage3 (OpenRC),
+        # we usually want udev. We OMIT systemd stuff.
         dracut --kver "$FULL_KVER" --force -N --xz \
-        --omit "systemd systemd-initrd systemd-networkd udev-rules lvm mdraid multipath" \
+        --omit "systemd systemd-initrd systemd-networkd systemd-udevd lvm mdraid multipath" \
         --add "base bash dmsquash-live pollcdrom busybox" \
         --add-drivers "squashfs loop overlay isofs cdrom sr_mod" \
         iso_build/boot/initramfs.img
@@ -219,7 +218,7 @@ jobs:
           ### Gentoo Linux Next
           - **Base**: Stage 3 OpenRC
           - **Kernel**: ${{ env.full_version }}
-          - **Builder**: Alpine Linux (Systemd-free)
+          - **Builder**: Alpine Linux
         files: gentoo-next.iso
         prerelease: true
       env:
